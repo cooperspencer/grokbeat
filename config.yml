@@ -1,0 +1,11 @@
+system:
+  dir: 
+
+elasticsearch:
+  url: 
+  port: 
+  protocol: 
+  index: 
+
+grok:
+  pattern: 
