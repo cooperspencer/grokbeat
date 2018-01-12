@@ -31,71 +31,74 @@ var (
 	El = elastic.InitEl()
 	index = ""
 	backup = "./backup"
+	toDelete = make(map[string]int)
+	//indices = make(map[string]bool)
 )
 
 func getMD5Hash(text string) string {
-	return fmt.Sprintf("%x", md5.Sum([]byte(text)))
+	hash := fmt.Sprintf("%x", md5.Sum([]byte(text)))
+	return hash
 }
 
 func printlen(filename string) {
-	//timeout := time.After(1 * time.Minute)
 	tick := time.Tick(100 * time.Millisecond)
 	for {
 		select{
-		/*
-		case <-timeout:
-			if len(grokedlines[filename]) >= 1000 {
-				log.Info("bulking")
-				status := elastic.BulkLogs(El, index, grokedlines[filename][:1000])
-				if status == 1 {
-					log.Error("couldn't bulk")
-					os.Exit(1)
-				}
-				mutex.Lock()
-				grokedlines[filename] = grokedlines[filename][1000:]
-				mutex.Unlock()
-			} else {
-				l := len(grokedlines[filename])
-				log.Info("sending normal")
-				status := elastic.Send(El, index, grokedlines[filename][:l])
-				if status == 1 {
-					log.Error("couldn't send")
-					os.Exit(1)
-				}
-				mutex.Lock()
-				grokedlines[filename] = grokedlines[filename][l:]
-				mutex.Unlock()
-			}
-		*/
 		case <-tick:
 			mutex.Lock()
 			lenGrokedLines := len(grokedlines[filename])
+			bulklimit, _ := strconv.ParseInt(elastic_params["bulklimit"], 0, 32)
 			mutex.Unlock()
 
-			log.Infof("%s: %d", filename, lenGrokedLines)
-
-			if lenGrokedLines > 1000 {
-				mutex.Lock()
-				status := elastic.BulkLogs(El, index, grokedlines[filename][:1000])
-				mutex.Unlock()
-				if status == 1 {
-					log.Error("couldn't bulk")
-					os.Exit(1)
+			if lenGrokedLines != 0 {
+				log.Infof("%s: %d", filename, lenGrokedLines)
+				if lenGrokedLines > int(bulklimit) {
+					mutex.Lock()
+					lines := grokedlines[filename][:int(bulklimit)]
+					mutex.Unlock()
+					status := elastic.BulkLogs(El, index, lines)
+					for status == 1 {
+						log.Error("elasticsearch seems down, trying again in 5 seconds")
+						time.Sleep(5)
+						status = elastic.BulkLogs(El, index, lines)
+					}
+					mutex.Lock()
+					grokedlines[filename] = grokedlines[filename][int(bulklimit):]
+					mutex.Unlock()
+				} else {
+					mutex.Lock()
+					l := len(grokedlines[filename])
+					mutex.Unlock()
+					mutex.Lock()
+					lines := grokedlines[filename][:l]
+					mutex.Unlock()
+					status := elastic.Send(El, index, lines)
+					if status == 1 {
+						log.Error("couldn't send")
+						os.Exit(1)
+					}
+					mutex.Lock()
+					grokedlines[filename] = grokedlines[filename][l:]
+					mutex.Unlock()
 				}
+			}
+			if lenGrokedLines == 0 && strings.HasPrefix(filename, "backup/backup_") {
 				mutex.Lock()
-				grokedlines[filename] = grokedlines[filename][1000:]
+				toDelete[filename] += 1
+				count := toDelete[filename]
 				mutex.Unlock()
+				if count >= 1000 {
+					log.Warnf("Deleting %s", filename)
+					os.Remove(filename)
+					mutex.Lock()
+					delete(toDelete, filename)
+					delete(grokedlines, filename)
+					mutex.Unlock()
+					return
+				}
 			} else {
 				mutex.Lock()
-				l := len(grokedlines[filename])
-				mutex.Unlock()
-				status := elastic.Send(El, index, grokedlines[filename][:l])
-				if status == 1 {
-					log.Error("couldn't send")
-					os.Exit(1)
-				}
-				mutex.Lock()
-				grokedlines[filename] = grokedlines[filename][l:]
+				toDelete[filename] = 0
 				mutex.Unlock()
 			}
 		}
@@ -135,14 +138,33 @@ func logtail(filename string, end int) {
 		}
 
 		id := getMD5Hash(logline)
-		parsedtime, _ := time.Parse("02/Jan/2006:15:04:05 -0700", values["timestamp"])
-		values["@timestamp"] = parsedtime.Format(time.RFC3339)
-		values["id"] = id
-		values["filename"] = filename
-		delete(values, "timestamp")
-		mutex.Lock()
-		grokedlines[filename] = append(grokedlines[filename], values)
-		mutex.Unlock()
+		found := elastic.SearchID(El, elastic_params["index"], elastic_params["doctype"], id)
+		if found == false {
+			parsedtime, _ := time.Parse("02/Jan/2006:15:04:05 -0700", values["timestamp"])
+			newindex := fmt.Sprintf("%s-%d.%d.%d", index, parsedtime.Year(), parsedtime.Month(), parsedtime.Day())
+
+			mutex.Lock()
+			//indexExists := indices[newindex]
+			docType := elastic_params["doctype"]
+			mutex.Unlock()
+			/*
+			if !indexExists {
+				createIndex(newindex, docType)
+				mutex.Lock()
+				indices[newindex] = true
+				mutex.Unlock()
+			}
+			*/
+			values["@timestamp"] = parsedtime.Format(time.RFC3339)
+			values["id"] = id
+			values["filename"] = filename
+			values["type"] = docType
+			values["_index"] = newindex
+			delete(values, "timestamp")
+			mutex.Lock()
+			grokedlines[filename] = append(grokedlines[filename], values)
+			mutex.Unlock()
+		}
 	}
 	defer wg.Done()
 }
@@ -183,6 +205,27 @@ func run(dir string) ([]string, error) {
 		}
 	}
 	return fileList, nil
+}
+
+func ifExists() {
+	for file := range(logfiles) {
+
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			delete(logfiles, file)
+		}
+
+	}
+}
+
+func createIndex(index, doctype string) {
+	status := elastic.CreateIndex(El, doctype, index)
+	switch status {
+	case 1:
+		log.Infof("created index %s", index)
+	case 2:
+		log.Infof("couldn't create index %s", index)
+		os.Exit(1)
+	}
 }
 
 func check(e error) {
@@ -252,26 +295,14 @@ func main() {
 	info, code, err := elastic.Version(El)
 
 	log.Infof("Elasticsearch returned with code %d and version %s", code, info.Version.Number)
-	status := elastic.CreateIndex(El, elastic_params["index"])
 	index = elastic_params["index"]
-
-
-	switch status {
-	case 0:
-		log.Infof(("index %s already exists"), elastic_params["index"])
-	case 1:
-		log.Infof("created index %s", elastic_params["index"])
-	case 2:
-		log.Infof("couldn't create index %s", elastic_params["index"])
-		os.Exit(1)
-	}
 
 	for {
 		run(dir)
 		run(backup)
+		ifExists()
 
 		for x := range logfiles {
-			log.Info(x)
 			for end := range pattern_index {
 				if logfiles[x] == false && strings.HasSuffix(x, pattern_index[end]){
 					go logtail(x, end)
@@ -288,8 +319,21 @@ func main() {
 						log.Warnf("backuping %s", x)
 						splittedfile := strings.Split(x, "/")
 						backupfile := "backup_" + splittedfile[len(splittedfile)-1]
-						err := os.Rename(x, backup + "/" + backupfile)
-						check(err)
+						backupf := backup + "/" + backupfile
+						tries := 1
+
+						for {
+							if _, err := os.Stat(backupf); os.IsNotExist(err) {
+								err := os.Rename(x, backupf)
+								check(err)
+								break
+							} else {
+								backupfile = fmt.Sprintf("backup_%d_%s", tries, splittedfile[len(splittedfile)-1])
+								backupf = backup + "/" + backupfile
+								log.Warn("File already exists. Trying next one!")
+							}
+						}
+
 					}
 				}
 			}

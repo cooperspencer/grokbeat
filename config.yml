@@ -7,9 +7,12 @@ elasticsearch:
   port: 
   protocol: 
   index: 
+  doctype: 
+  bulklimit: 
 
 grok:
   patterns:
     # For example
     access.log:
       - '%{COMMONAPACHELOG}%{SPACE}\"%{DATA:usertest}\"'
+
