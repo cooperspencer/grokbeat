@@ -12,6 +12,8 @@ import (
 	"crypto/md5"
 	"grokbeat/libs/elastic"
 	"github.com/vjeantet/grok"
+	"strings"
+	"strconv"
 )
 
 var (
@@ -22,10 +24,13 @@ var (
 	mutex = sync.RWMutex{}
 	sys_params = make(map[string]string)
 	elastic_params = make(map[string]string)
-	grok_params = make(map[string]string)
+	grok_params = make(map[string]interface{})
+	patterns = make(map[string]interface{})
+	pattern_index = []string{}
 	g, _ = grok.New()
 	El = elastic.InitEl()
 	index = ""
+	backup = "./backup"
 )
 
 func getMD5Hash(text string) string {
@@ -33,22 +38,25 @@ func getMD5Hash(text string) string {
 }
 
 func printlen(filename string) {
-	timeout := time.After(1 * time.Minute)
-	tick := time.Tick(1 * time.Second)
+	//timeout := time.After(1 * time.Minute)
+	tick := time.Tick(100 * time.Millisecond)
 	for {
 		select{
+		/*
 		case <-timeout:
-			if len(grokedlines[filename]) >= 500 {
-				status := elastic.BulkLogs(El, index, grokedlines[filename][:500])
+			if len(grokedlines[filename]) >= 1000 {
+				log.Info("bulking")
+				status := elastic.BulkLogs(El, index, grokedlines[filename][:1000])
 				if status == 1 {
 					log.Error("couldn't bulk")
 					os.Exit(1)
 				}
 				mutex.Lock()
-				grokedlines[filename] = grokedlines[filename][500:]
+				grokedlines[filename] = grokedlines[filename][1000:]
 				mutex.Unlock()
 			} else {
 				l := len(grokedlines[filename])
+				log.Info("sending normal")
 				status := elastic.Send(El, index, grokedlines[filename][:l])
 				if status == 1 {
 					log.Error("couldn't send")
@@ -58,17 +66,36 @@ func printlen(filename string) {
 				grokedlines[filename] = grokedlines[filename][l:]
 				mutex.Unlock()
 			}
-
+		*/
 		case <-tick:
-			log.Infof("%s: %d", filename, len(grokedlines[filename]))
-			if len(grokedlines[filename]) > 500 {
-				status := elastic.BulkLogs(El, index, grokedlines[filename][:500])
+			mutex.Lock()
+			lenGrokedLines := len(grokedlines[filename])
+			mutex.Unlock()
+
+			log.Infof("%s: %d", filename, lenGrokedLines)
+
+			if lenGrokedLines > 1000 {
+				mutex.Lock()
+				status := elastic.BulkLogs(El, index, grokedlines[filename][:1000])
+				mutex.Unlock()
 				if status == 1 {
 					log.Error("couldn't bulk")
 					os.Exit(1)
 				}
 				mutex.Lock()
-				grokedlines[filename] = grokedlines[filename][500:]
+				grokedlines[filename] = grokedlines[filename][1000:]
+				mutex.Unlock()
+			} else {
+				mutex.Lock()
+				l := len(grokedlines[filename])
+				mutex.Unlock()
+				status := elastic.Send(El, index, grokedlines[filename][:l])
+				if status == 1 {
+					log.Error("couldn't send")
+					os.Exit(1)
+				}
+				mutex.Lock()
+				grokedlines[filename] = grokedlines[filename][l:]
 				mutex.Unlock()
 			}
 		}
@@ -76,7 +103,7 @@ func printlen(filename string) {
 	}
 }
 
-func logtail(filename string) {
+func logtail(filename string, end int) {
 	t, err := tail.TailFile(filename, tail.Config{Follow:true, ReOpen:true})
 
 	go printlen(filename)
@@ -89,13 +116,31 @@ func logtail(filename string) {
 		logline := line.Text
 		mutex.Lock()
 		loglines[filename] = append(loglines[filename], logline)
-		values, _ := g.Parse(grok_params["pattern"], logline)
+		mutex.Unlock()
+		pattern := patterns[pattern_index[end]].([]interface{})
+		values := make(map[string]string)
+		len_keys := 0;
+		for i := range pattern {
+			if len_keys == 0 {
+				values, _ = g.Parse(pattern[i].(string), logline)
+				for range values {
+					len_keys++;
+				}
+			} else {
+				break
+			}
+		}
+		if len_keys == 0 {
+			log.Errorf("%s: The parser doesn't fit", filename);
+		}
+
 		id := getMD5Hash(logline)
 		parsedtime, _ := time.Parse("02/Jan/2006:15:04:05 -0700", values["timestamp"])
 		values["@timestamp"] = parsedtime.Format(time.RFC3339)
 		values["id"] = id
 		values["filename"] = filename
 		delete(values, "timestamp")
+		mutex.Lock()
 		grokedlines[filename] = append(grokedlines[filename], values)
 		mutex.Unlock()
 	}
@@ -147,6 +192,27 @@ func check(e error) {
 	}
 }
 
+func getSize(size int64) (filesize map[string]float64) {
+	var kilobytes float64
+	var megabytes float64
+	var gigabytes float64
+	var terabytes float64
+
+	kilobytes = float64(size / 1024)
+	megabytes = float64(kilobytes / 1024)
+	gigabytes = float64(megabytes / 1024)
+	terabytes = float64(gigabytes / 1024)
+
+	filesize = make(map[string]float64)
+
+	filesize["K"] = kilobytes
+	filesize["M"] = megabytes
+	filesize["G"] = gigabytes
+	filesize["T"] = terabytes
+
+	return filesize
+}
+
 func main() {
 	// read the config
 	viper.SetConfigFile("./config.yml")
@@ -156,7 +222,13 @@ func main() {
 	sys_params = viper.GetStringMapString("system")
 	elastic_params = viper.GetStringMapString("elasticsearch")
 	elastic_params["elastic_url"] = fmt.Sprintf("%s://%s:%s", elastic_params["protocol"], elastic_params["url"], elastic_params["port"])
-	grok_params = viper.GetStringMapString("grok")
+	grok_params = viper.GetStringMap("grok")
+
+	patterns = grok_params["patterns"].(map[string]interface{})
+
+	for key := range patterns {
+		pattern_index = append(pattern_index, key)
+	}
 
 	// set the logger
 	customFormatter := new(log.TextFormatter)
@@ -167,6 +239,9 @@ func main() {
 	log.SetOutput(os.Stdout)
 
 	dir := sys_params["dir"]
+	size := sys_params["filesize"]
+	bytes := size[len(sys_params["filesize"])-1:]
+	maxsize, _ := strconv.ParseFloat(size[:len(sys_params["filesize"])-1], 64)
 
 	check(err)
 
@@ -183,7 +258,7 @@ func main() {
 
 	switch status {
 	case 0:
-		log.Infof("index %s already exists", elastic_params["index"])
+		log.Infof(("index %s already exists"), elastic_params["index"])
 	case 1:
 		log.Infof("created index %s", elastic_params["index"])
 	case 2:
@@ -193,13 +268,30 @@ func main() {
 
 	for {
 		run(dir)
+		run(backup)
 
 		for x := range logfiles {
 			log.Info(x)
-			if logfiles[x] == false {
-				go logtail(x)
-				wg.Add(1)
-				logfiles[x] = true
+			for end := range pattern_index {
+				if logfiles[x] == false && strings.HasSuffix(x, pattern_index[end]){
+					go logtail(x, end)
+					wg.Add(1)
+					logfiles[x] = true
+				}
+				if strings.HasSuffix(x, pattern_index[end]) {
+					file, _ := os.Open(x)
+					defer file.Close()
+					stat, _ := file.Stat()
+					filesize := getSize(stat.Size())
+					log.Infof("%s: Filesize %f", x, filesize[bytes])
+					if maxsize < filesize[bytes] && !strings.Contains(x, "backup/backup_") {
+						log.Warnf("backuping %s", x)
+						splittedfile := strings.Split(x, "/")
+						backupfile := "backup_" + splittedfile[len(splittedfile)-1]
+						err := os.Rename(x, backup + "/" + backupfile)
+						check(err)
+					}
+				}
 			}
 		}
 		time.Sleep(30 * time.Second)

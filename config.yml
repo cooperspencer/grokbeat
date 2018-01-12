@@ -1,5 +1,6 @@
 system:
   dir: 
+  filesize: 
 
 elasticsearch:
   url: 
@@ -8,4 +9,7 @@ elasticsearch:
   index: 
 
 grok:
-  pattern: 
+  patterns:
+    # For example
+    access.log:
+      - '%{COMMONAPACHELOG}%{SPACE}\"%{DATA:usertest}\"'
