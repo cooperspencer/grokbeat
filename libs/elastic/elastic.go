@@ -8,11 +8,17 @@ import (
 	"fmt"
 	"encoding/json"
 	"time"
+	"sync"
 )
 
 type Elastic struct {
 	ElasticSearch *elastic.Client
 	url 		  string
+}
+
+type ConcurrentList struct {
+	Items []map[string]string
+	sync.RWMutex
 }
 
 type Search struct {
@@ -58,9 +64,86 @@ type Search struct {
 	} `json:"_source"`
 }
 
+func New() *ConcurrentList {
+	return &ConcurrentList{Items: make([]map[string]string, 0)}
+}
+
+func (c ConcurrentList) Length() int {
+	c.Lock()
+	defer c.Unlock()
+
+	return len(c.Items)
+}
+
+func (c *ConcurrentList) Add(value map[string]string) (int, error) {
+	c.Lock()
+	defer c.Unlock()
+
+	c.Items = append(c.Items, value)
+	return 0, nil
+}
+
+func (c *ConcurrentList) Resize(size int) {
+	defer c.Unlock()
+	c.Lock()
+
+	c.Items = c.Items[:size]
+}
+
+func (c *ConcurrentList) GetNums(size int) ([]map[string]string){
+	c.Lock()
+	defer c.Unlock()
+
+	return c.Items[size:]
+}
+
+func (c *ConcurrentList) Get(pos int) (map[string]string) {
+	c.Lock()
+	defer c.Unlock()
+
+	return c.Items[pos]
+}
+
+var (
+	mutex = sync.RWMutex{}
+)
+
 func InitEl() (ela *Elastic) {
 	client, _ := elastic.NewClient()
 	return &Elastic{client, ""}
+}
+
+func Tick(size int, ela *Elastic, log *ConcurrentList) {
+	tick := 100 * time.Millisecond
+	for {
+		length := log.Length() - 1
+
+		howmany := length / size
+
+		if length > size {
+			for i := 0; i < howmany; i++ {
+				logs := log.GetNums(size)
+				status := BulkLogs(ela, logs)
+
+				for status == 1 {
+					time.Sleep(5 * time.Second)
+					size = size - 100
+					logs := log.GetNums(size)
+					status = BulkLogs(ela, logs)
+				}
+				log.Resize(size)
+			}
+		} else {
+			if length > 0 {
+				for i := length; i >= 0; i-- {
+					logs := log.Get(i)
+					Send(ela, logs)
+				}
+				log.Resize(length)
+			}
+		}
+		time.Sleep(tick)
+	}
 }
 
 func NewElastic(elasticurl string) (ela *Elastic, err error){
@@ -110,11 +193,11 @@ func CreateIndex(elastic *Elastic, doctype, index string) (status int) {
 	}
 }
 
-func BulkLogs(elasticsearch *Elastic, index string, loglines []map[string]string) (status int) {
+func BulkLogs(elasticsearch *Elastic, loglines []map[string]string) (status int) {
 	bulkRequest := elasticsearch.ElasticSearch.Bulk()
 	for _, logline := range loglines {
 		if logline != nil {
-			index = logline["_index"]
+			index := logline["_index"]
 			delete(logline, "_index")
 			req := elastic.NewBulkIndexRequest().Index(index).Type(logline["type"]).Id(logline["id"]).Doc(logline)
 			bulkRequest = bulkRequest.Add(req)
@@ -122,21 +205,19 @@ func BulkLogs(elasticsearch *Elastic, index string, loglines []map[string]string
 	}
 	bulkResponse, err := bulkRequest.Do(context.Background())
 	if err != nil {
+		fmt.Println(err)
 		return 1
 	}
 	bulkResponse.Created()
 	return 0
 }
 
-func Send(elasticsearch *Elastic, index string, loglines []map[string]string) (status int) {
-	for _, logline := range loglines {
-		index = logline["_index"]
-		delete(logline, "_index")
-		_, err := elasticsearch.ElasticSearch.Index().Index(index).Type(logline["type"]).Id(logline["id"]).BodyJson(logline).Do(context.Background())
-
-		if err != nil {
-			return 1
-		}
+func Send(elasticsearch *Elastic, logline map[string]string) (status int) {
+	index := logline["_index"]
+	delete(logline, "_index")
+	_, err := elasticsearch.ElasticSearch.Index().Index(index).Type(logline["type"]).Id(logline["id"]).BodyJson(logline).Do(context.Background())
+	if err != nil {
+		return 1
 	}
 	return 0
 }
@@ -146,8 +227,11 @@ func SearchID(elasticsearch *Elastic, index, doctype, id string) (status bool) {
 	found := Search{}
 	resp, err := http.Get(url)
 	if err != nil {
-		fmt.Println("threw an error")
-		return false
+		time.Sleep(5 * time.Second)
+		resp, err = http.Get(url)
+		if err != nil {
+			return false
+		}
 	}
 	defer resp.Body.Close()
 	json.NewDecoder(resp.Body).Decode(&found)
