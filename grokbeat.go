@@ -10,17 +10,20 @@ import (
 	"time"
 	"github.com/hpcloud/tail"
 	"crypto/md5"
-	"grokbeat/libs/elastic"
+	"grokbeat_noclass/libs/elastic"
 	"github.com/vjeantet/grok"
 	"strings"
 	"strconv"
+	"io"
+	"bytes"
+	_ "net/http/pprof"
+	"net/http"
 )
 
 var (
-	wg sync.WaitGroup
 	logfiles = make(map[string]bool)
-	loglines = make(map[string][]string)
-	grokedlines = make(map[string][]map[string]string)
+	filelines = make(map[string]int)
+	backuplines = make(map[string]int)
 	mutex = sync.RWMutex{}
 	sys_params = make(map[string]string)
 	elastic_params = make(map[string]string)
@@ -31,142 +34,126 @@ var (
 	El = elastic.InitEl()
 	index = ""
 	backup = "./backup"
-	toDelete = make(map[string]int)
+	backuppedlines = make(map[string]int)
+	logs = elastic.New()
 	//indices = make(map[string]bool)
 )
+
+func writeStatus() {
+	for {
+		file, _ := os.Create("status.yml")
+		defer file.Close()
+		fmt.Fprintln(file, "status:")
+		mutex.Lock()
+		for key, value := range filelines {
+			if backuppedlines[key] > value {
+				value = backuppedlines[key]
+			}
+			fmt.Fprintf(file, "  %s: %d\n", key, value)
+		}
+		mutex.Unlock()
+		time.Sleep(1 * time.Minute)
+	}
+}
 
 func getMD5Hash(text string) string {
 	hash := fmt.Sprintf("%x", md5.Sum([]byte(text)))
 	return hash
 }
 
-func printlen(filename string) {
-	tick := time.Tick(100 * time.Millisecond)
+func countLines(filename string) (end int ) {
+	file, err := os.Open(filename)
+	check(err)
+
+	buf := make([]byte, 1024)
+	lines := 0
+
 	for {
-		select{
-		case <-tick:
-			mutex.Lock()
-			lenGrokedLines := len(grokedlines[filename])
-			bulklimit, _ := strconv.ParseInt(elastic_params["bulklimit"], 0, 32)
-			mutex.Unlock()
+		readBytes, err := file.Read(buf)
 
-			if lenGrokedLines != 0 {
-				log.Infof("%s: %d", filename, lenGrokedLines)
-				if lenGrokedLines > int(bulklimit) {
-					mutex.Lock()
-					lines := grokedlines[filename][:int(bulklimit)]
-					mutex.Unlock()
-					status := elastic.BulkLogs(El, index, lines)
-					for status == 1 {
-						log.Error("elasticsearch seems down, trying again in 5 seconds")
-						time.Sleep(5)
-						status = elastic.BulkLogs(El, index, lines)
-					}
-					mutex.Lock()
-					grokedlines[filename] = grokedlines[filename][int(bulklimit):]
-					mutex.Unlock()
-				} else {
-					mutex.Lock()
-					l := len(grokedlines[filename])
-					mutex.Unlock()
-					mutex.Lock()
-					lines := grokedlines[filename][:l]
-					mutex.Unlock()
-					status := elastic.Send(El, index, lines)
-					if status == 1 {
-						log.Error("couldn't send")
-						os.Exit(1)
-					}
-					mutex.Lock()
-					grokedlines[filename] = grokedlines[filename][l:]
-					mutex.Unlock()
-				}
+		if err != nil {
+			if readBytes == 0 && err == io.EOF {
+				err = nil
 			}
-			if lenGrokedLines == 0 && strings.HasPrefix(filename, "backup/backup_") {
-				mutex.Lock()
-				toDelete[filename] += 1
-				count := toDelete[filename]
-				mutex.Unlock()
-				if count >= 1000 {
-					log.Warnf("Deleting %s", filename)
-					os.Remove(filename)
-					mutex.Lock()
-					delete(toDelete, filename)
-					delete(grokedlines, filename)
-					mutex.Unlock()
-					return
-				}
-			} else {
-				mutex.Lock()
-				toDelete[filename] = 0
-				mutex.Unlock()
-			}
+			return lines
 		}
-
+		lines += bytes.Count(buf[:readBytes], []byte{'\n'})
 	}
+	return lines
 }
 
-func logtail(filename string, end int) {
-	t, err := tail.TailFile(filename, tail.Config{Follow:true, ReOpen:true})
 
-	go printlen(filename)
+func logtail(filename string, end int) {
+	t, err := tail.TailFile(filename, tail.Config{Follow:true, ReOpen:true, Logger: tail.DiscardingLogger,})
 
 	if err != nil {
 		panic(err)
 	}
 
 	for line := range t.Lines {
-		logline := line.Text
 		mutex.Lock()
-		loglines[filename] = append(loglines[filename], logline)
+		linenr := filelines[filename]
+		backline := backuppedlines[filename]
 		mutex.Unlock()
-		pattern := patterns[pattern_index[end]].([]interface{})
-		values := make(map[string]string)
-		len_keys := 0;
-		for i := range pattern {
-			if len_keys == 0 {
-				values, _ = g.Parse(pattern[i].(string), logline)
-				for range values {
-					len_keys++;
+		if backline < linenr {
+			logline := line.Text
+			id := getMD5Hash(fmt.Sprintf("%s-%i", logline, linenr))
+			pattern := patterns[pattern_index[end]].([]interface{})
+			values := make(map[string]string)
+			len_keys := 0;
+			for i := range pattern {
+				if len_keys == 0 {
+					values, _ = g.Parse(pattern[i].(string), logline)
+					for range values {
+						len_keys++;
+					}
+				} else {
+					break
 				}
-			} else {
-				break
 			}
-		}
-		if len_keys == 0 {
-			log.Errorf("%s: The parser doesn't fit", filename);
-		}
+			if len_keys == 0 {
+				log.Errorf("%s: The parser doesn't fit", filename);
+			}
 
-		id := getMD5Hash(logline)
-		found := elastic.SearchID(El, elastic_params["index"], elastic_params["doctype"], id)
-		if found == false {
 			parsedtime, _ := time.Parse("02/Jan/2006:15:04:05 -0700", values["timestamp"])
-			newindex := fmt.Sprintf("%s-%d.%d.%d", index, parsedtime.Year(), parsedtime.Month(), parsedtime.Day())
-
-			mutex.Lock()
-			//indexExists := indices[newindex]
-			docType := elastic_params["doctype"]
-			mutex.Unlock()
-			/*
-			if !indexExists {
-				createIndex(newindex, docType)
+			newindex := fmt.Sprintf("%s-%04d.%02d.%02d", index, parsedtime.Year(), parsedtime.Month(), parsedtime.Day())
+			found := elastic.SearchID(El, newindex, elastic_params["doctype"], id)
+			if found == false {
 				mutex.Lock()
-				indices[newindex] = true
+				//indexExists := indices[newindex]
+				docType := elastic_params["doctype"]
 				mutex.Unlock()
+				values["@timestamp"] = parsedtime.Format(time.RFC3339)
+				values["id"] = id
+				values["filename"] = filename
+				values["type"] = docType
+				values["_index"] = newindex
+				delete(values, "timestamp")
+				logs.Add(values)
+				values = make(map[string]string)
+				linenr++
+				mutex.Lock()
+				filelines[filename] = linenr
+				mutex.Unlock()
+			} else {
+				log.Warnf("Document with ID %s already exists", id)
 			}
-			*/
-			values["@timestamp"] = parsedtime.Format(time.RFC3339)
-			values["id"] = id
-			values["filename"] = filename
-			values["type"] = docType
-			values["_index"] = newindex
-			delete(values, "timestamp")
+
+			if strings.HasPrefix(filename, "backup/backup_") {
+				mutex.Lock()
+				end := backuplines[filename]
+				mutex.Unlock()
+				if end == linenr {
+					os.Remove(filename)
+				}
+			}
+		} else {
+			linenr++
 			mutex.Lock()
-			grokedlines[filename] = append(grokedlines[filename], values)
+			filelines[filename] = linenr
 			mutex.Unlock()
 		}
 	}
-	defer wg.Done()
 }
 
 func fileExists() {
@@ -200,7 +187,12 @@ func run(dir string) ([]string, error) {
 
 		if !stat.IsDir() {
 			if inList(file) {
+				mutex.Lock()
 				logfiles[file] = false
+				if strings.Contains(file, "backup/backup_") {
+					backuplines[file] = countLines(file)
+				}
+				mutex.Unlock()
 			}
 		}
 	}
@@ -281,6 +273,10 @@ func main() {
 	log.SetFormatter(customFormatter)
 	log.SetOutput(os.Stdout)
 
+	go func() {
+		log.Info(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	dir := sys_params["dir"]
 	size := sys_params["filesize"]
 	bytes := size[len(sys_params["filesize"])-1:]
@@ -297,6 +293,28 @@ func main() {
 	log.Infof("Elasticsearch returned with code %d and version %s", code, info.Version.Number)
 	index = elastic_params["index"]
 
+	limit := int64(1000)
+	if _, ok := elastic_params["bulklimit"]; ok {
+		limit, _ = strconv.ParseInt(elastic_params["bulklimit"], 0, 32)
+	}
+
+	if _, err := os.Stat("./status.yml"); err == nil {
+		viper.SetConfigFile("./status.yml")
+		err := viper.ReadInConfig()
+		check(err)
+		stats := viper.GetStringMap("status")
+		for key, value := range stats {
+			backuppedlines[key] = value.(int)
+			fmt.Printf("%s: %d\n", key, value.(int))
+		}
+	}
+
+	go func(){
+		elastic.Tick(int(limit), El, logs)
+	}()
+
+	go writeStatus()
+
 	for {
 		run(dir)
 		run(backup)
@@ -306,10 +324,16 @@ func main() {
 			for end := range pattern_index {
 				if logfiles[x] == false && strings.HasSuffix(x, pattern_index[end]){
 					go logtail(x, end)
-					wg.Add(1)
 					logfiles[x] = true
 				}
+
 				if strings.HasSuffix(x, pattern_index[end]) {
+					mutex.Lock()
+					if _, ok := filelines[x]; !ok {
+						filelines[x] = 0
+						backuppedlines[x] = 0
+					}
+					mutex.Unlock()
 					file, _ := os.Open(x)
 					defer file.Close()
 					stat, _ := file.Stat()
@@ -325,6 +349,10 @@ func main() {
 						for {
 							if _, err := os.Stat(backupf); os.IsNotExist(err) {
 								err := os.Rename(x, backupf)
+								mutex.Lock()
+								filelines[x] = 0
+								backuppedlines[x] = 0
+								mutex.Unlock()
 								check(err)
 								break
 							} else {
@@ -336,10 +364,11 @@ func main() {
 
 					}
 				}
+
 			}
 		}
 		time.Sleep(30 * time.Second)
 		log.Info("reload")
-		fileExists()
+		//fileExists()
 	}
 }
